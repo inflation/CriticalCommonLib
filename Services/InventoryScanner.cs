@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.InteropServices;
 using AllaganLib.GameSheets.Sheets;
 using AllaganLib.GameSheets.Sheets.Helpers;
 using CriticalCommonLib.Addons;
@@ -11,9 +12,7 @@ using CriticalCommonLib.Services.Ui;
 using Dalamud.Game.Addon.Lifecycle;
 using Dalamud.Game.Addon.Lifecycle.AddonArgTypes;
 using Dalamud.Hooking;
-using Dalamud.Memory;
 using Dalamud.Plugin.Services;
-using Dalamud.Utility.Signatures;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.Game.UI;
 using FFXIVClientStructs.FFXIV.Client.System.Framework;
@@ -64,7 +63,7 @@ namespace CriticalCommonLib.Services
             IGameInterface gameInterface, IOdrScanner odrScanner, IGameInteropProvider gameInteropProvider,
             CabinetSheet cabinetSheet, ExcelSheet<MirageStoreSetItem> mirageStoreSetItemSheet, IPluginLog pluginLog,
             ItemSheet itemSheet, IClientState clientState, IMarketOrderService marketOrderService, IAddonLifecycle addonLifecycle,
-            IPlayerState playerState)
+            IPlayerState playerState, ISigScanner sigScanner)
         {
             _gameUiManager = gameUiManager;
             _framework = framework;
@@ -101,8 +100,12 @@ namespace CriticalCommonLib.Services
 
             _framework.RunOnFrameworkThread(() =>
             {
-                _gameInteropProvider.InitializeFromAttributes(this);
+                _usesCnContainerInfoHandler = TryScanCnContainerInfoHandler(sigScanner, out var handler);
+                if (_usesCnContainerInfoHandler || sigScanner.TryScanText(GlobalContainerInfoSignature, out handler))
+                    _containerInfoNetworkHook = _gameInteropProvider.HookFromAddress<ContainerInfoNetworkData>(handler, ContainerInfoDetour);
                 _containerInfoNetworkHook?.Enable();
+                if (_usesCnContainerInfoHandler)
+                    _pluginLog.Information("Enabled the CN ContainerInfo hook");
             });
             framework.Update += FrameworkOnUpdate;
             _gameUiManager.UiVisibilityChanged += GameUiManagerOnUiManagerVisibilityChanged;
@@ -420,25 +423,42 @@ namespace CriticalCommonLib.Services
 
         public event ContainerInfoReceivedDelegate? ContainerInfoReceived;
 
-        private unsafe delegate void* ContainerInfoNetworkData(int a2, int* a3);
+        private unsafe delegate void* ContainerInfoNetworkData(int sequence, byte* packet);
 
-        private unsafe delegate void* ItemMarketBoardInfoData(nint networkInstance, int a2, int* a3);
-
-        private unsafe delegate void* NpcSpawnData(int* a1, int a2, int* a3);
-
-        //If the signature for these are ever lost, find the ProcessZonePacketDown signature in Dalamud and then find the relevant function based on the opcode.
-        [Signature("E8 ?? ?? ?? ?? E9 ?? ?? ?? ?? 48 8B D7 41 8B CE E8 ?? ?? ?? ?? E9 ?? ?? ?? ?? 48 8B D7 41 8B CE E8 ?? ?? ?? ?? E9 ?? ?? ?? ?? 48 8B D7 41 8B CE E8 ?? ?? ?? ?? E9 ?? ?? ?? ?? 48 8D 57 10", DetourName = nameof(ContainerInfoDetour), UseFlags = SignatureUseFlags.Hook)]
-        private Hook<ContainerInfoNetworkData>? _containerInfoNetworkHook = null;
+        private const string GlobalContainerInfoSignature = "E8 ?? ?? ?? ?? E9 ?? ?? ?? ?? 48 8B D7 41 8B CE E8 ?? ?? ?? ?? E9 ?? ?? ?? ?? 48 8B D7 41 8B CE E8 ?? ?? ?? ?? E9 ?? ?? ?? ?? 48 8B D7 41 8B CE E8 ?? ?? ?? ?? E9 ?? ?? ?? ?? 48 8D 57 10";
+        private const string CnContainerInfoSignature = "E8 ?? ?? ?? ?? E9 ?? ?? ?? ?? 48 8B D7 8B CE E8 ?? ?? ?? ?? E9 ?? ?? ?? ?? 48 8B D7 8B CE E8 ?? ?? ?? ?? E9 ?? ?? ?? ?? 48 8B D7 8B CE E8 ?? ?? ?? ?? E9 ?? ?? ?? ?? 48 8D 57 10 8B CE";
+        private const string CnContainerInfoWorkerSignature = "48 89 6C 24 10 48 89 74 24 18 57 48 81 EC 80 00 00 00 41 0F B7 40 02 48 8B F1 B9 98 01 00 00 49 8B F8 8B EA 66 3B C1";
+        private const ushort CnContainerInfoOpcode = 0x0198;
+        private Hook<ContainerInfoNetworkData>? _containerInfoNetworkHook;
+        private bool _usesCnContainerInfoHandler;
 
         private readonly HashSet<InventoryType> _loadedInventories = new();
 
-        private unsafe void* ContainerInfoDetour(int seq, int* a3)
+        private static bool TryScanCnContainerInfoHandler(ISigScanner scanner, out nint handler)
+        {
+            if (!scanner.TryScanText(CnContainerInfoSignature, out handler) ||
+                !scanner.TryScanText(CnContainerInfoWorkerSignature, out var worker))
+                return false;
+
+            var offset = handler - scanner.Module.BaseAddress;
+            var textOffset = offset - scanner.TextSectionOffset;
+            if (textOffset < 0 || textOffset > scanner.TextSectionSize - 17)
+                return false;
+
+            // The dispatch thunk must jump to the worker that checks the CN opcode.
+            var thunk = scanner.SearchBase + offset;
+            return Marshal.ReadByte(thunk, 12) == 0xE9 &&
+                   handler + 17 + Marshal.ReadInt32(thunk, 13) == worker;
+        }
+
+        private unsafe void* ContainerInfoDetour(int sequence, byte* packet)
         {
             try
             {
-                if (a3 != null)
+                // The CN dispatcher calls the same handler for several inventory packet types.
+                if (packet != null && (!_usesCnContainerInfoHandler || *(ushort*)(packet + 2) == CnContainerInfoOpcode))
                 {
-                    var ptr = (IntPtr)a3 + 16;
+                    var ptr = (IntPtr)(packet + 16);
                     var containerInfo = NetworkDecoder.DecodeContainerInfo(ptr);
                     if (Enum.IsDefined(typeof(InventoryType), containerInfo.containerId))
                     {
@@ -450,7 +470,6 @@ namespace CriticalCommonLib.Services
                                 ContainerInfoReceived?.Invoke(containerInfo, inventoryType);
                             },
                             TimeSpan.FromMilliseconds(100));
-                        ;
                     }
                 }
             }
@@ -458,11 +477,11 @@ namespace CriticalCommonLib.Services
             {
                 _framework.RunOnFrameworkThread(() =>
                 {
-                    _pluginLog.Error(e, "shits broke yo");
+                    _pluginLog.Error(e, "Failed to process a ContainerInfo packet");
                 });
             }
 
-            return _containerInfoNetworkHook!.Original(seq, a3);
+            return _containerInfoNetworkHook!.Original(sequence, packet);
         }
 
         public void ParseBags()
