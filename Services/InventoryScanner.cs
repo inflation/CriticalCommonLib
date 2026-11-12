@@ -1505,15 +1505,18 @@ namespace CriticalCommonLib.Services
 
         public unsafe void ParseFreeCompanyBags(BagChangeContainer changeSet)
         {
+            var scanOpenChest = _containerInfoNetworkHook == null &&
+                                _characterMonitor.ActiveFreeCompanyId != 0 &&
+                                _gameUiManager.IsWindowVisible(WindowName.FreeCompanyChest);
             for (var b = 0; b < _freeCompanyBagTypes.Length; b++)
             {
                 var bagType = _freeCompanyBagTypes[b];
-                if (_loadedInventories.Contains(bagType))
+                if (scanOpenChest || _loadedInventories.Contains(bagType))
                 {
-                    InMemory.Add(bagType);
                     var bag = InventoryManager.Instance()->GetInventoryContainer(bagType);
                     if (bag != null && bag->IsLoaded)
                     {
+                        InMemory.Add(bagType);
                         InventoryItem[]? fcItems = null;
                         switch (bagType)
                         {
@@ -1746,35 +1749,47 @@ namespace CriticalCommonLib.Services
             }
         }
 
+        private static readonly InventoryType[] RetainerBagTypes =
+        {
+            InventoryType.RetainerPage1, InventoryType.RetainerPage2, InventoryType.RetainerPage3,
+            InventoryType.RetainerPage4, InventoryType.RetainerPage5, InventoryType.RetainerPage6,
+            InventoryType.RetainerPage7, InventoryType.RetainerEquippedItems, InventoryType.RetainerGil,
+            InventoryType.RetainerCrystals, InventoryType.RetainerMarket
+        };
+
+        private unsafe bool CanScanRetainer(ulong retainerId)
+        {
+            if (_containerInfoNetworkHook != null)
+                return RetainerBagTypes.All(_loadedInventories.Contains);
+
+            if (!_gameUiManager.IsWindowVisible(WindowName.InventoryRetainer) &&
+                !_gameUiManager.IsWindowVisible(WindowName.InventoryRetainerLarge))
+                return false;
+
+            var manager = RetainerManager.Instance();
+            var retainer = manager != null ? manager->GetActiveRetainer() : null;
+            if (retainer == null || retainer->RetainerId != retainerId)
+                return false;
+
+            var inventory = InventoryManager.Instance();
+            foreach (var type in RetainerBagTypes)
+            {
+                var container = inventory->GetInventoryContainer(type);
+                if (container == null || !container->IsLoaded)
+                    return false;
+            }
+
+            return true;
+        }
+
         public unsafe void ParseRetainerBags(InventorySortOrder currentSortOrder, BagChangeContainer changeSet)
         {
             var currentRetainer = _characterMonitor.ActiveRetainerId;
-            if (currentRetainer != 0 && _loadedInventories.Contains(InventoryType.RetainerPage1) &&
-                _loadedInventories.Contains(InventoryType.RetainerPage2) &&
-                _loadedInventories.Contains(InventoryType.RetainerPage3) &&
-                _loadedInventories.Contains(InventoryType.RetainerPage4) &&
-                _loadedInventories.Contains(InventoryType.RetainerPage5) &&
-                _loadedInventories.Contains(InventoryType.RetainerPage6) &&
-                _loadedInventories.Contains(InventoryType.RetainerPage7) &&
-                _loadedInventories.Contains(InventoryType.RetainerEquippedItems) &&
-                _loadedInventories.Contains(InventoryType.RetainerGil) &&
-                _loadedInventories.Contains(InventoryType.RetainerCrystals) &&
-                _loadedInventories.Contains(InventoryType.RetainerMarket)
-               )
+            if (currentRetainer != 0 && CanScanRetainer(currentRetainer))
             {
                 if (!InMemoryRetainers.ContainsKey(currentRetainer))
                     InMemoryRetainers.Add(currentRetainer, new HashSet<InventoryType>());
-                InMemoryRetainers[currentRetainer].Add(InventoryType.RetainerPage1);
-                InMemoryRetainers[currentRetainer].Add(InventoryType.RetainerPage2);
-                InMemoryRetainers[currentRetainer].Add(InventoryType.RetainerPage3);
-                InMemoryRetainers[currentRetainer].Add(InventoryType.RetainerPage4);
-                InMemoryRetainers[currentRetainer].Add(InventoryType.RetainerPage5);
-                InMemoryRetainers[currentRetainer].Add(InventoryType.RetainerPage6);
-                InMemoryRetainers[currentRetainer].Add(InventoryType.RetainerPage7);
-                InMemoryRetainers[currentRetainer].Add(InventoryType.RetainerEquippedItems);
-                InMemoryRetainers[currentRetainer].Add(InventoryType.RetainerGil);
-                InMemoryRetainers[currentRetainer].Add(InventoryType.RetainerCrystals);
-                InMemoryRetainers[currentRetainer].Add(InventoryType.RetainerMarket);
+                InMemoryRetainers[currentRetainer].UnionWith(RetainerBagTypes);
 
                     if (!RetainerBag1.ContainsKey(currentRetainer))
                         RetainerBag1.Add(currentRetainer, new InventoryItem[35]);
